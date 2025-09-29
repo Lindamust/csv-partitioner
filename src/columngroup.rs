@@ -1,13 +1,14 @@
-use crate::{headerrowview::HeaderRowView, range::Range, rowview::RowView};
+use crate::{headerrowview::HeaderRowView, range::Range, rowiterator::RowIterator, rowview::RowView};
 
-use std::io::Read;
+use std::{io::Read, sync::Arc};
+
 use csv::{Error, Reader, StringRecord};
 
 pub struct ColumnGroup<'a, R: Read> {
-    pub reader: &'a mut Reader<R>,
+    reader: &'a mut Reader<R>,
     range: &'a Range,
     group_index: usize,
-    pub headers_caches: Option<&'a StringRecord>
+    headers_cached: Option<&'a StringRecord>
 }
 
 impl<'a, R: Read> ColumnGroup<'a, R> {
@@ -17,9 +18,9 @@ impl<'a, R: Read> ColumnGroup<'a, R> {
         reader: &'a mut Reader<R>,
         range: &'a Range,
         group_index: usize,
-        headers_caches: Option<&'a StringRecord>
+        headers_cached: Option<&'a StringRecord>
     ) -> Self {
-        ColumnGroup { reader, range, group_index, headers_caches }
+        ColumnGroup { reader, range, group_index, headers_cached }
     }
 
     pub fn range(&self) -> &Range {
@@ -40,21 +41,33 @@ impl<'a, R: Read> ColumnGroup<'a, R> {
         self.range().len()
     }
 
-    pub fn header_row(&'a self) -> Result<HeaderRowView<'a>, Error> {
+    pub fn header_row(&'a self) -> Result<HeaderRowView, Error> {
         // get header row for this group
 
-        Ok(HeaderRowView::new(
-            self.headers_caches.unwrap(), 
-            self.range(), 
-            self.group_index()
-        ))
+        if let Some(headers) = self.headers_cached {
+            let column_names: Vec<Arc<str>> = headers
+                .iter()
+                .skip(self.range().lower)
+                .take(self.range().len())
+                .map(|s| Arc::from(s))
+                .collect();
+            Ok(HeaderRowView::new(column_names, self.group_index()))
+        } else {
+            Err(Error::from(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Missing headers",
+            )))
+        }
     }
 
-    pub fn rows(&mut self) -> impl Iterator<Item = Result<RowView, Error>> {
+    pub fn rows(&mut self) -> RowIterator<'_, R> {
         // iterator over data rows
 
-        // hold on this might be impossible within my current framework...
-        // ill give it a rest.
+        RowIterator::new(self.reader, self.range, self.group_index)
+    }
+
+    pub fn all_rows(&mut self) -> RowIterator<'_, R> {
+        
     }
 
 }
