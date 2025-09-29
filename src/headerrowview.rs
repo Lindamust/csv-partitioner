@@ -1,21 +1,18 @@
-use csv::StringRecord;
-use super::range::Range;
+use std::sync::Arc;
 
-pub struct HeaderRowView<'a> {
-    pub record: &'a StringRecord,
-    pub range: &'a Range,
-    pub group_index: usize,
+pub struct HeaderRowView {
+    column_names: Vec<Arc<str>>,
+    group_index: usize,
 }
 
-impl<'a> HeaderRowView<'a> {
+impl HeaderRowView {
 
-    // private constructor, only ColumnGroup should create HeaderRowView
+    // internal constructor, only ColumnGroup should create HeaderRowView
     pub(crate) fn new(
-        record: &'a StringRecord,
-        range: &'a Range,
+        column_names: Vec<Arc<str>>,
         group_index: usize
     ) -> Self {
-        HeaderRowView { record, range, group_index }
+        HeaderRowView { column_names, group_index }
     }
 
     pub fn group_index(&self) -> usize {
@@ -27,25 +24,19 @@ impl<'a> HeaderRowView<'a> {
     pub fn column_count(&self) -> usize {
         // number of columns in this header
 
-        self.range.len()
+        self.column_names.len()
     }
 
     pub fn get_column_name(&self, local_index: usize) -> Option<&str> {
         // get header at local index
 
-        if let Some(global_index) = self.range.local_to_global(local_index) {
-            return self.record.get(global_index);
-        }
-        None
+        self.column_names.get(local_index).map(|arc_str| arc_str.as_ref())
     }
 
     pub fn column_names(&self) -> impl Iterator<Item = &str> {
         // iterator over header names
 
-        self.record
-            .iter()
-            .skip(self.range.lower)
-            .take(self.column_count())
+        self.column_names.iter().map(AsRef::as_ref)
     }
 
     pub fn column_names_with_indicies(&self) -> impl Iterator<Item = (usize, &str)> {
@@ -56,8 +47,19 @@ impl<'a> HeaderRowView<'a> {
 
     pub fn column_names_with_global_indicies(&self) -> impl Iterator<Item = (usize, &str)> {
         // headers with global column indicies; global enumerate equivalent
-
+        
+        let base = self.group_index() * self.column_count();
         self.column_names_with_indicies()
-            .map(move |(local_idx, field )| (self.range.lower + local_idx, field))
+            .map(move |(local_idx, field)| (base + local_idx, field))
+    }
+}
+
+// cheap cloning thanks to Arc<str>
+impl Clone for HeaderRowView {
+    fn clone(&self) -> Self {
+        Self {
+            column_names: self.column_names.clone(),    // just clones Arc references
+            group_index: self.group_index,
+        }
     }
 }

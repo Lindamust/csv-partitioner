@@ -1,23 +1,22 @@
-use csv::StringRecord;
-use super::range::Range;
+use std::sync::Arc;
 
-pub struct RowView<'a> {
-    record: &'a StringRecord,
-    range: &'a Range,
-    row_index: usize, // 0 for header, 1+ for data rows
+
+// represents one complete row with cheap-to-clone owned data
+pub struct RowView {
+    fields: Vec<Arc<str>>,  // owned, shareable field data
+    row_index: usize,   // 0 for header, 1+ for data rows
     group_index: usize,
 }
 
-impl<'a> RowView<'a> {
+impl RowView {
 
-    // private constructor, only ColumnGroup should create RowViews
+    // internal constructor, only RowIterator should yield RowViews
     pub(crate) fn new(
-        record: &'a StringRecord,
-        range: &'a Range,
+        fields: Vec<Arc<str>>,
         row_index: usize,
         group_index: usize
     ) -> Self {
-        RowView { record, range , row_index , group_index }
+        RowView { fields, row_index , group_index }
     }
 
     pub fn row_index(&self) -> usize {
@@ -42,39 +41,45 @@ impl<'a> RowView<'a> {
     }
 
     pub fn field_count(&self) -> usize {
-        // number of fields in this row
+        // number of fields in this row -> len of fields Vec
 
-        self.range.len()
+        self.fields.len()
     }
 
     pub fn get_field(&self, local_index: usize) -> Option<&str> {
         // get field at local column index
 
-        if let Some(global_index) = self.range.local_to_global(local_index) {
-            return self.record.get(global_index);
-        }
-        None
+        self.fields.get(local_index).map(|arc_str| arc_str.as_ref()) 
     }
 
     pub fn fields(&self) -> impl Iterator<Item = &str> {
-        // iterator over field values in this row's range
+        // iterator over field values (&str)
 
-        self.record
-            .iter()
-            .skip(self.range.lower)
-            .take(self.range.len())
+        self.fields.iter().map(AsRef::as_ref)
     }
 
-    pub fn fields_with_indicies(&self) -> impl Iterator<Item = (usize, &str)> {
+    pub fn fields_with_indices(&self) -> impl Iterator<Item = (usize, &str)> {
         // fields with local indicies; local enumerate equivalent
 
         self.fields().enumerate()
     }
 
-    pub fn fields_with_global_indicies(&self) -> impl Iterator<Item = (usize, &str)> {
+    pub fn fields_with_global_indices(&self) -> impl Iterator<Item = (usize, &str)> {
         // fields with global column indicies; global enumerate equivalent
 
-        self.fields_with_indicies()
-            .map(move |(local_idx, field)| (self.range.lower + local_idx, field))
+        let base = self.group_index() * self.field_count();
+        self.fields_with_indices()
+            .map(move |(local_idx, field)| (base + local_idx, field))
+    }
+}
+
+// cheap cloning thanks to Arc<str>
+impl Clone for RowView  {
+    fn clone(&self) -> Self {
+        Self {
+            fields: self.fields.clone(),    // just clones Arc references
+            row_index: self.row_index,
+            group_index: self.group_index,
+        }
     }
 }
