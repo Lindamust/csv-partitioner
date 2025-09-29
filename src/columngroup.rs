@@ -1,9 +1,9 @@
-use crate::{headerrowview::HeaderRowView, range::Range, rowiterator::RowIterator, rowview::RowView};
-
+use crate::{rowview::HeaderRowView, range::Range, rowiterator::{AllRowIterator, RowIterator}};
 use std::{io::Read, sync::Arc};
-
 use csv::{Error, Reader, StringRecord};
 
+
+// represents one column range, yields RowView iterators with 'owned' data
 pub struct ColumnGroup<'a, R: Read> {
     reader: &'a mut Reader<R>,
     range: &'a Range,
@@ -66,8 +66,12 @@ impl<'a, R: Read> ColumnGroup<'a, R> {
         RowIterator::new(self.reader, self.range, self.group_index)
     }
 
-    pub fn all_rows(&mut self) -> RowIterator<'_, R> {
-        
+    pub fn all_rows(&mut self) -> AllRowIterator<'_, R> {
+        AllRowIterator::new(
+            self.reader, 
+            self.range, 
+            self.group_index, 
+            self.headers_cached,
+        )
     }
-
 }
