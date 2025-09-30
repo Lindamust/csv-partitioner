@@ -1,6 +1,5 @@
 
 
-// top level coordinator that yields column group iterators
 
 use std::{error::Error, io::Read, sync::Arc};
 
@@ -8,6 +7,7 @@ use csv::{Reader, StringRecord};
 
 use crate::range::Range;
 
+/// top level coordinator that yields column group iterators
 pub struct Partition<R: Read> {
     reader: Reader<R>,                      // consumes reader
     ranges: Arc<[Range]>,                   // don't actually need to mutate range values, just used as read + cheap copy
@@ -15,8 +15,9 @@ pub struct Partition<R: Read> {
 }
 
 impl<R: Read> Partition<R> {
+
+    /// create a new partition with equal-sized column groups
     pub fn new(mut reader: Reader<R>, num_groups: usize) -> Result<Self, Box<dyn Error>> {
-        // create a new partition with equal-sized column groups
 
         // quick input validation
         if num_groups == 0 {
@@ -57,8 +58,8 @@ impl<R: Read> Partition<R> {
         })
     }
 
+    /// create a partition with custom column ranges, very similiar to new(...) implementation
     pub fn with_custom_ranges(mut reader: Reader<R>, ranges: Vec<Range>) -> Result<Self, Box<dyn Error>> {
-        // create a partition with custom column ranges, very similiar to new(...) implementation
         
         // quick input validation
         if ranges.is_empty() {
@@ -83,8 +84,8 @@ impl<R: Read> Partition<R> {
         })
     }
 
+    /// internal validation method
     fn validate_ranges(ranges: &[Range], total_columns: usize) -> Result<(), Box<dyn Error>> {
-        // internal validation method
 
         // check bounds
         for (i, range) in ranges.iter().enumerate() {
@@ -122,4 +123,35 @@ impl<R: Read> Partition<R> {
         Ok(())
     }
 
+
+    // now just boiler plate functions
+
+    /// number of column groups
+    pub fn group_count(&self) -> usize {
+        self.ranges.len()
+    }
+
+    /// total of CSV columns
+    pub fn total_columns(&self) -> usize {
+        self.headers_cached
+            .as_ref()
+            .map(|h| h.len())
+            .unwrap_or(0)
+    }
+
+    /// ranges getter and potential dereffer
+    pub fn ranges(&self) -> &[Range] {
+        &self.ranges    // can deref Arc<[Range]> to &[Range]
+    }
+
+    pub fn headers(&mut self) -> Result<&StringRecord, Box<dyn Error>> {
+        if let Some(ref headers) = self.headers_cached {
+            Ok(headers)
+        } else {
+            let headers: &StringRecord = self.reader.headers()?;
+            self.headers_cached = Some(headers.clone());
+            Ok(self.headers_cached.as_ref().unwrap())
+        }
+    }
+    
 }
