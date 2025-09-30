@@ -5,7 +5,7 @@ use std::{error::Error, io::Read, sync::Arc};
 
 use csv::{Reader, StringRecord};
 
-use crate::range::Range;
+use crate::{columngroup::ColumnGroup, range::Range};
 
 /// top level coordinator that yields column group iterators
 pub struct Partition<R: Read> {
@@ -123,6 +123,38 @@ impl<R: Read> Partition<R> {
         Ok(())
     }
 
+    /// yields the column group for a specific range
+    pub fn create_group(&mut self, group_index: usize) -> Option<ColumnGroup<R>> {
+        let range: &Range = self.ranges.get(group_index)?;
+
+        Some(ColumnGroup::new(
+            &mut self.reader, 
+            range, 
+            group_index, 
+            self.headers_cached.as_ref(),
+        ))
+    }
+
+    /// iterator over all column groups, consuming self to avoid multiple mutable borrows
+    pub fn into_groups(mut self) -> impl for<'_> Iterator<Item = ColumnGroup<'_, R>> {
+        let ranges = Arc::clone(&self.ranges);
+        let headers = self.headers_cached.take();
+        let mut groups = Vec::with_capacity(ranges.len());
+        for (i, range) in ranges.iter().enumerate() {
+            let headers_clone = headers.as_ref().cloned();
+            groups.push(ColumnGroup::new(
+                &mut self.reader,
+                range,
+                i,
+                headers_clone.as_ref(),
+            ));
+        }
+        groups.into_iter()
+    }
+    
+    pub fn groups_with_indicies(&mut self) -> impl Iterator<Item = (usize, ColumnGroup<'_, R>)> {
+        self.into_groups().enumerate()
+    }
 
     // now just boiler plate functions
 
@@ -139,11 +171,17 @@ impl<R: Read> Partition<R> {
             .unwrap_or(0)
     }
 
-    /// ranges getter and potential dereffer
+    /// ranges getter and potential dereffer, lifetime tied to &self
     pub fn ranges(&self) -> &[Range] {
         &self.ranges    // can deref Arc<[Range]> to &[Range]
     }
 
+    /// ranges getter but Arc
+    pub fn ranges_arc(&self) -> Arc<[Range]> {
+        Arc::clone(&self.ranges)    // just increments the reference count
+    }
+
+    /// headers getter, get cached header record
     pub fn headers(&mut self) -> Result<&StringRecord, Box<dyn Error>> {
         if let Some(ref headers) = self.headers_cached {
             Ok(headers)
