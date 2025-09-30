@@ -1,4 +1,6 @@
 // defines column boundaries
+
+#[derive(Clone, Copy)]
 pub struct Range {
     pub lower: usize,   // inclusive start column
     pub upper: usize,   // exclusive end column

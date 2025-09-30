@@ -6,7 +6,7 @@ use crate::{range::Range, rowview::RowView};
 // iterator that reads CSV records and converts it ot RowView with Arc<str> data
 pub struct RowIterator<'a, R: Read> {
     reader: &'a mut Reader<R>,
-    range: &'a Range,
+    range: &'a Range,                  // reference to range from arc
     group_index: usize,
     current_row_index: usize,
     record_buffer: StringRecord,
