@@ -63,10 +63,16 @@ impl<'a, R: Read> ColumnGroup<'a, R> {
     pub fn rows(&mut self) -> RowIterator<'_, R> {
         // iterator over data rows
 
-        RowIterator::new(self.reader, self.range, self.group_index)
+        RowIterator::new(
+            self.reader, 
+            self.range, 
+            self.group_index
+        )
     }
 
     pub fn all_rows(&mut self) -> AllRowIterator<'_, R> {
+        // iterator over header + data rows
+
         AllRowIterator::new(
             self.reader, 
             self.range, 
