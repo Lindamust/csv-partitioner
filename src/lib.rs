@@ -1,9 +1,9 @@
 // lmao i realised that instead of building a really big and complicated system, i could just do this lmao
+// context: while i thought deeply about an intricate system, i ultimately fell victim to the borrow checker...
+// i legit had like 3 types of iterators wrapped in Arc<> all simultaneously borrowing a reader it was so peak
 
 use std::{error::Error, ops::Range, io::Read};
 use csv::{Reader, StringRecord};
-
-
 
 /// describes a group's column range
 #[derive(Debug)]
@@ -21,6 +21,15 @@ pub struct CsvPartitioner<R: Read> {
 impl<R: Read> CsvPartitioner<R> {
     pub fn new(reader: Reader<R>, partitions: Vec<Partition>) -> Self {
         Self {reader, partitions }
+    }
+
+    pub fn new_from_header(mut reader: Reader<R>) -> Result<Self, csv::Error> {
+        let header = reader.headers()?.clone();
+
+        // detect partitions automatically
+        let partitions = detect_partitions_from_header(&header);
+
+        Ok(Self { reader, partitions })
     }
 
     /// single-pass row iterator using a callback
@@ -49,6 +58,11 @@ impl<'a> GroupView<'a> {
     }
 }
 
+/// generic serialise trait for whatever struct you want, implement yourself
+trait FromGroupView: Sized {
+    fn from_group(group: &GroupView) -> Self;
+}
+
 /// split a row into group views, helper
 pub fn row_to_groups<'a>(
     row: &'a StringRecord,
@@ -66,6 +80,80 @@ pub fn row_to_groups<'a>(
             GroupView { fields: slice }
         })
         .collect()
+}
+
+
+/// for when you intentionally leave headers blank i.e. \n
+/// vocab.csv:
+/// verbs, , , adjectives, , , noodle recipes, ,
+/// to indicate where you want to partition
+pub fn detect_partitions_from_header(header: &StringRecord) -> Vec<Partition> {
+    let mut partitions = Vec::new();
+    let mut i = 0;
+
+    while i< header.len() {
+        let cell = header.get(i).unwrap_or("").trim();
+        if !cell.is_empty() {
+            // start of new partition
+            let start = i;
+            let name = cell.to_string();
+
+            // find end of partition (next non-empty column)
+            let mut end = start + 1;
+            while end < header.len() && header.get(end).unwrap_or("").trim().is_empty() {
+                end += 1;
+            }
+
+            partitions.push(Partition {
+                name,
+                range: start..end,
+            });
+
+            i = end;
+        } else {
+            i += 1;
+        }
+    } 
+
+    partitions
+}
+
+
+/// # Generic deserializer example
+///
+/// This demonstrates how to generically map a group of CSV columns to your own struct.
+///
+/// ```ignore
+/// // Suppose you have a struct:
+/// struct MyStruct {
+///     field1: String,
+///     field2: String,
+///     field3: String,
+/// }
+///
+/// // And a vector to collect them:
+/// let mut items: Vec<MyStruct> = Vec::new();
+///
+/// // In your CSV processing:
+/// csvp.for_each_row(|row, partitions| {
+///     let groups = row_to_groups(row, partitions);
+///     for group in groups {
+///         let item = deserialise_group(&group, |g| MyStruct {
+///             field1: g.get(0).unwrap_or("").trim().to_string(),
+///             field2: g.get(1).unwrap_or("").trim().to_string(),
+///             field3: g.get(2).unwrap_or("").trim().to_string(),
+///         });
+///         items.push(item);
+///     }
+/// })?;
+/// ```
+///
+/// The `deserialise_group` function:
+pub fn deserialise_group<T, F>(group: &GroupView, f: F) -> T
+where 
+    F: Fn(&GroupView) -> T,
+{
+    f(group)
 }
 
 #[cfg(test)]
@@ -119,7 +207,7 @@ mod tests {
 //!
     use super::*;
 
-
+    // using for examples,
     #[derive(Debug, PartialEq)]
     struct Topic {
         name: String,
@@ -134,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn main() -> Result<(), Box<dyn Error>> {
+    fn test1() -> Result<(), Box<dyn Error>> {
         let file_path = "vocab.csv";
         let rdr = csv::Reader::from_path(file_path)?;
 
@@ -167,6 +255,57 @@ mod tests {
             }
         })?;
 
+
+        assert_eq!(
+            topics[0], 
+            Topic {
+                name: "verbs".to_string(),
+                words: vec![
+                    Word { japanese: "おどろく".to_string(), translation: "to be surprised".to_string(), kanji: "驚く".to_string() },
+                    Word { japanese: "しぬ".to_string(), translation: "to die".to_string(), kanji: "死ぬ".to_string() },
+                ]
+            }
+        );
+
+        assert_eq!(
+            topics[1], 
+            Topic {
+                name: "adjectives".to_string(),
+                words: vec![
+                    Word { japanese: "はやい".to_string(), translation: "fast/quick".to_string(), kanji: "早い".to_string() },
+                    Word { japanese: "むずかしい".to_string(), translation: "difficult/troublesome".to_string(), kanji: "難しい".to_string() },
+                ]
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test2() -> Result<(), Box<dyn Error>> {
+        // using same vocab.csv from previous example
+        let rdr = csv::Reader::from_path("vocab.csv")?;
+        let mut csvp = CsvPartitioner::new_from_header(rdr)?;
+
+        // initialise empty topics
+        let mut topics: Vec<Topic> = csvp.partitions
+            .iter()
+            .map(|p| Topic { name: p.name.clone(), words: Vec::new() })
+            .collect();
+
+        // do the thing
+        csvp.for_each_row(|row, partitions| {
+            let groups = row_to_groups(row, partitions);
+
+            for (i, group) in groups.into_iter().enumerate() {
+                let word = Word {
+                    japanese: group.get(0).unwrap_or("").to_string(),
+                    translation: group.get(1).unwrap_or("").to_string(),
+                    kanji: group.get(2).unwrap_or("").to_string(),
+                };
+                topics[i].words.push(word);
+            }
+        })?;
 
         assert_eq!(
             topics[0], 
