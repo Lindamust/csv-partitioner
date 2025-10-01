@@ -135,15 +135,27 @@ impl<R: Read> Partition<R> {
         ))
     }
 
-    /// iterator over all column groups, consuming self to avoid multiple mutable borrows
-    pub fn into_groups(mut self) -> impl for<'_> Iterator<Item = ColumnGroup<'_, R>> {
+    /// iterator over all column groups
+    /// iterating like: for group in partition.groups {...} should yield columngroups
+    /// idea: columngroup iterator
+    /// problem: can't have multiple mut references to self
+    /// however, a mut ref to self is needed to construct a columngroup
+    /// and a columngroup needs a mut ref to self to construct rowiter
+    /// which yield rowviews, which uses the original reader to read the fields
+    /// solution ideas:
+    /// need to somehow avoid the multiple mut self refs, these refs are mut only
+    /// because of the reader, so instead of directly consuming a reader when initialising a partition,
+    /// i could instead only initialise a reader when i need to read the field values in rowview
+    /// however this is a complete waste of memory and incredibly inefficient...
+    /// 
+    pub fn groups(&mut self) -> impl Iterator<Item = ColumnGroup<'_, R>> {
         let ranges = Arc::clone(&self.ranges);
         let headers = self.headers_cached.take();
         let mut groups = Vec::with_capacity(ranges.len());
         for (i, range) in ranges.iter().enumerate() {
             let headers_clone = headers.as_ref().cloned();
             groups.push(ColumnGroup::new(
-                &mut self.reader,
+                &mut self.reader,   // <--- multiple mut references made from this
                 range,
                 i,
                 headers_clone.as_ref(),
@@ -153,7 +165,7 @@ impl<R: Read> Partition<R> {
     }
     
     pub fn groups_with_indicies(&mut self) -> impl Iterator<Item = (usize, ColumnGroup<'_, R>)> {
-        self.into_groups().enumerate()
+        self.groups().enumerate()
     }
 
     // now just boiler plate functions
