@@ -2,14 +2,14 @@
 #![allow(unused_imports)]
 
 // lmao i realised that instead of building a really big and complicated system, i could just do this lmao
-// context: while i thought deeply about an intricate system, i ultimately fell victim to the borrow checker...
+// context: i fell victim to the borrow checker...
 // i legit had like 3 types of iterators wrapped in Arc<> all simultaneously borrowing a reader it was so peak
 
 use std::{error::Error, ops::Range, io::Read};
 use csv::{Reader, StringRecord};
 
 /// describes a group's column range
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Partition {
     pub name: String,
     range: Range<usize>,
@@ -49,8 +49,8 @@ impl<R: Read> CsvPartitioner<R> {
         Ok(())
     }
 
-    pub fn get_partitions(&self) -> Vec<Partition> {
-        self.partitions
+    pub fn get_partitions_owned(&self) -> Vec<Partition> {
+        self.partitions.clone()
     }
 }
 
