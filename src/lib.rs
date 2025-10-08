@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
 // lmao i realised that instead of building a really big and complicated system, i could just do this lmao
 // context: while i thought deeply about an intricate system, i ultimately fell victim to the borrow checker...
 // i legit had like 3 types of iterators wrapped in Arc<> all simultaneously borrowing a reader it was so peak
@@ -232,7 +235,7 @@ mod tests {
             Partition { name: "adjectives".into(), range: 3..6 },
         ];
 
-        // initiate topics collective with empty word vectors
+        // initiate topics collection with empty word vectors
         let mut topics: Vec<Topic> = partitions
             .iter()
             .map(|partition| Topic { name: partition.name.clone(), words: Vec::new() })
