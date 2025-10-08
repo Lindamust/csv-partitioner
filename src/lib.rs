@@ -49,7 +49,7 @@ impl<R: Read> CsvPartitioner<R> {
         Ok(())
     }
 
-    pub fn get_partitions(&self) -> Vec<Partitions> {
+    pub fn get_partitions(&self) -> Vec<Partition> {
         self.partitions
     }
 }
