@@ -9,7 +9,7 @@ use std::{error::Error, ops::Range, io::Read};
 use csv::{Reader, StringRecord};
 
 /// describes a group's column range
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Partition {
     pub name: String,
     range: Range<usize>,
