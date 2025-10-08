@@ -11,7 +11,7 @@ use csv::{Reader, StringRecord};
 /// describes a group's column range
 #[derive(Debug)]
 pub struct Partition {
-    name: String,
+    pub name: String,
     range: Range<usize>,
 }
 
