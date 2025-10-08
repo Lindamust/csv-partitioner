@@ -11,14 +11,14 @@ use csv::{Reader, StringRecord};
 /// describes a group's column range
 #[derive(Debug)]
 pub struct Partition {
-    pub name: String,
+    name: String,
     range: Range<usize>,
 }
 
 /// main csv partitioner
 pub struct CsvPartitioner<R: Read> {
     reader: Reader<R>,
-    pub partitions: Vec<Partition>,
+    partitions: Vec<Partition>,
 }
 
 impl<R: Read> CsvPartitioner<R> {
@@ -47,6 +47,10 @@ impl<R: Read> CsvPartitioner<R> {
         }
 
         Ok(())
+    }
+
+    pub fn get_partitions(&self) -> Vec<Partitions> {
+        self.partitions
     }
 }
 
