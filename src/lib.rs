@@ -18,7 +18,7 @@ pub struct Partition {
 /// main csv partitioner
 pub struct CsvPartitioner<R: Read> {
     reader: Reader<R>,
-    partitions: Vec<Partition>,
+    pub partitions: Vec<Partition>,
 }
 
 impl<R: Read> CsvPartitioner<R> {
