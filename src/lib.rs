@@ -1,341 +1,629 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
-
-// lmao i realised that instead of building a really big and complicated system, i could just do this lmao
-// context: i fell victim to the borrow checker...
-// i legit had like 3 types of iterators wrapped in Arc<> all simultaneously borrowing a reader it was so peak
-
-use std::{error::Error, ops::Range, io::Read};
-use csv::{Reader, StringRecord};
-
-/// describes a group's column range
-#[derive(Debug, Clone)]
-pub struct Partition {
-    pub name: String,
-    range: Range<usize>,
-}
-
-/// main csv partitioner
-pub struct CsvPartitioner<R: Read> {
-    reader: Reader<R>,
-    partitions: Vec<Partition>,
-}
-
-impl<R: Read> CsvPartitioner<R> {
-    pub fn new(reader: Reader<R>, partitions: Vec<Partition>) -> Self {
-        Self {reader, partitions }
-    }
-
-    pub fn new_from_header(mut reader: Reader<R>) -> Result<Self, csv::Error> {
-        let header = reader.headers()?.clone();
-
-        // detect partitions automatically
-        let partitions = detect_partitions_from_header(&header);
-
-        Ok(Self { reader, partitions })
-    }
-
-    /// single-pass row iterator using a callback
-    pub fn for_each_row<F>(&mut self, mut f: F) -> Result<(), csv::Error>
-    where 
-        F : FnMut(&StringRecord, &[Partition])
-    {
-        let mut buffer = StringRecord::new();
-
-        while self.reader.read_record(&mut buffer)? {
-            f(&buffer, &self.partitions);
-        }
-
-        Ok(())
-    }
-
-    pub fn get_partitions_owned(&self) -> Vec<Partition> {
-        self.partitions.clone()
-    }
-}
-
-/// view of one group in a row (slice of columns)
-pub struct GroupView<'a> {
-    fields: Vec<&'a str>,
-}
-
-impl<'a> GroupView<'a> {
-    pub fn get(&self, idx: usize) -> Option<&'a str> {
-        self.fields.get(idx).copied()
-    }
-}
-
-/// generic serialise trait for whatever struct you want, implement yourself
-trait FromGroupView: Sized {
-    fn from_group(group: &GroupView) -> Self;
-}
-
-/// split a row into group views, helper
-pub fn row_to_groups<'a>(
-    row: &'a StringRecord,
-    partitions: &'a [Partition]
-) -> Vec<GroupView<'a>> {
-    partitions
-        .iter()
-        .map(|p| {
-            let slice: Vec<&str> = row
-                .iter()
-                .skip(p.range.start)
-                .take(p.range.len())
-                .map(|s| s.trim())
-                .collect::<Vec<&str>>();
-            GroupView { fields: slice }
-        })
-        .collect()
-}
+//! # csv-slice-parser
+//!
+//! Simple Rust library for parsings CSV files with repeating column structures.
+//! Things like vocab lists seperated by topic/language (my use case, which prompted me to make this)
+//! or just any CSV where columns repeat in a predictable pattern.
+//!
+//! ## Features
+//!
+//! - **Type-safe deserialisation** into custom structs
+//! - **Configurable parsing** behaviour
+//!
+//! TODO:
+//! - parallel processing support
+//!
+//! ## Quick Start
+//!
+//! ```rust
+//! use csv_slice_parser::{CsvSliceParser, FromColumnSlice};
+//! use csv::StringRecord;
+//! use std::error::Error;
+//!
+//! // 1. Define your struct
+//! #[derive(Debug, Clone)]
+//! struct VocabEntry {
+//!     word: String,
+//!     translation: String,
+//!     example: String,
+//! }
+//!
+//! // 2. implement FromColumnSlice
+//! impl FromColumnSlice for VocabEntry {
+//!     const COLUMN_COUNT: usize = 3;
+//!
+//!     fn from_record(record: &StringRecord, start_col: usize) -> Result<Self, Box<dyn Error>> {
+//!         Ok(VocabEntry {
+//!             word: record.get(start_col)
+//!                 .ok_or("Missing word")?
+//!                 .to_string(),
+//!             translation: record.get(start_col + 1)
+//!                 .ok_or("Missing translation")?
+//!                 .to_string(),
+//!             example: record.get(start_col + 2)
+//!                 .ok_or("Missing example")?
+//!                 .to_string(),
+//!         })
+//!     }
+//! }
+//!
+//! // 3. parse your CSV
+//! # fn example() -> Result<(), Box<dyn Error>> {
+//!     let parser = CsvSliceParser::from_file("vocabulary.csv")?;
+//!     let slice1_entries = Vec<VocabEntry> = parser.parse_slice(0)?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## CSV structure example
+//!
+//! for a csv like this:
+//! ```csv
+//! English,Spanish,Example,French,Translation,Example
+//! hello,hola,Hello friend,bonjour,hello,bonjour ami
+//! ```
 
 
-/// for when you intentionally leave headers blank i.e. \n
-/// vocab.csv:
-/// verbs, , , adjectives, , , noodle recipes, ,
-/// to indicate where you want to partition
-pub fn detect_partitions_from_header(header: &StringRecord) -> Vec<Partition> {
-    let mut partitions = Vec::new();
-    let mut i = 0;
+use csv::{ReaderBuilder, StringRecord};
+use std::error::Error;
+use std::fs::{File};
+use std::path::Path;
 
-    while i< header.len() {
-        let cell = header.get(i).unwrap_or("").trim();
-        if !cell.is_empty() {
-            // start of new partition
-            let start = i;
-            let name = cell.to_string();
-
-            // find end of partition (next non-empty column)
-            let mut end = start + 1;
-            while end < header.len() && header.get(end).unwrap_or("").trim().is_empty() {
-                end += 1;
-            }
-
-            partitions.push(Partition {
-                name,
-                range: start..end,
-            });
-
-            i = end;
-        } else {
-            i += 1;
-        }
-    } 
-
-    partitions
-}
-
-
-/// # Generic deserializer example
+/// Trait for types that can be deserialized from a slice of CSV columns.
 ///
-/// This demonstrates how to generically map a group of CSV columns to your own struct.
+/// Implement this trait to define how your struct maps to CSV columns.
+pub trait FromColumnSlice: Sized {
+    /// The number of columns this type contains
+    ///
+    /// This determines how the CSV is sliced. For a struct with 3 fields,
+    /// this should be 3.
+    const COLUMN_COUNT: usize;
+
+
+    /// Deserialise from a 'StringRecord' starting at the given column index
+    ///
+    /// # Arguments:
+    ///
+    /// * 'record' - The CSV record containing the data
+    /// * 'start_col' - The starting column index for this slice
+    ///
+    /// # Returns
+    ///
+    /// * 'Ok(Self)' - successfully returns parsed struct
+    /// * 'Err(Box<dyn Error>)' - parsing error with description
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use csv_slice_parser::FromColumnSlice;
+    /// # use csv::StringRecord;
+    /// # use std::error::Error;
+    /// # struct MyStruct { field1: String, field2: String }
+    /// # impl FromColumnSlice for MyStruct {
+    /// #     const COLUMN_COUNT: usize = 2;
+    /// fn from_record(record: &StringRecord, start_col: usize) -> Result<Self, Box<dyn Error>> {
+    ///     // Validate column exists before parsing
+    ///     let field1 = record.get(start_col)
+    ///         .ok_or("Missing first column")?
+    ///         .to_string();
+    ///
+    ///     // Parse numeric types with error handling
+    ///     let field2 = record.get(start_col + 1)
+    ///         .ok_or("Missing second column")?
+    ///         .to_string();
+    ///
+    ///     Ok(MyStruct { field1, field2 })
+    /// }
+    /// # }
+    /// ```
+    fn from_record(record: &StringRecord, start_col: usize) -> Result<Self, Box<dyn Error>>;
+}
+
+
+/// Configuration for CSV parsing behaviour
 ///
-/// ```ignore
-/// // Suppose you have a struct:
-/// struct MyStruct {
+/// Use this to customize how the parser handles edge cases and performance trade-offs.
+///
+/// # Example
+///
+/// ```rust
+/// use csv_partitioner::ParseConfig;
+/// use csv_slice_parser::ParseConfig;
+///
+/// let config = ParseConfig {
+///     skip_empty_rows = true,
+///     reserve_capacity = true,
+///     trim_fields = true,
+/// }
+/// ```
+pub struct ParseConfig {
+    /// Skip rows where all columns in the slice are empty.
+    ///
+    /// When `true`, rows like `"", "", ""` are filtered out.
+    /// Default: `true`
+    pub skip_empty_rows: bool,
+
+    /// Pre-allocate capacity in result vectors based on record count.
+    ///
+    /// When `true`. reduces reallocations but uses more memory upfront.
+    /// Default: `true`
+    pub reserve_capacity: bool,
+
+    /// Trim whitespaces from all fields during CSV reading
+    ///
+    /// When `true`, `" hello "` becomes `"hello"`.
+    /// Default: `true`
+    pub trim_fields: bool,
+}
+
+impl Default for ParseConfig {
+    fn default() -> Self {
+        ParseConfig {
+            skip_empty_rows: true,
+            reserve_capacity: true,
+            trim_fields: true,
+        }
+    }
+}
+
+/// Main parser
+/// 
+/// # Example
+///
+/// ```rust
+/// use csv_slice_parser::{CsvSliceParser, FromColumnSlice, ParseConfig};
+/// use csv::StringRecord;
+/// use std::error::Error;
+///
+/// #[derive(Debug)]
+/// struct Entry {
 ///     field1: String,
 ///     field2: String,
 ///     field3: String,
 /// }
 ///
-/// // And a vector to collect them:
-/// let mut items: Vec<MyStruct> = Vec::new();
-///
-/// // In your CSV processing:
-/// csvp.for_each_row(|row, partitions| {
-///     let groups = row_to_groups(row, partitions);
-///     for group in groups {
-///         let item = deserialise_group(&group, |g| MyStruct {
-///             field1: g.get(0).unwrap_or("").trim().to_string(),
-///             field2: g.get(1).unwrap_or("").trim().to_string(),
-///             field3: g.get(2).unwrap_or("").trim().to_string(),
-///         });
-///         items.push(item);
+/// impl FromColumnSlice for Entry {
+///     const COLUMN_COUNT: usize = 3;
+///     
+///     fn from_record(record: &StringRecord, start_col: usize) -> Result<Self, Box<dyn Error>> {
+///         Ok(Entry {
+///             field1: record.get(start_col).unwrap_or("").to_string(),
+///             field2: record.get(start_col + 1).unwrap_or("").to_string(),
+///             field3: record.get(start_col + 2).unwrap_or("").to_string(),
+///         })
 ///     }
-/// })?;
-/// ```
+/// }
 ///
-/// The `deserialise_group` function:
-pub fn deserialise_group<T, F>(group: &GroupView, f: F) -> T
-where 
-    F: Fn(&GroupView) -> T,
-{
-    f(group)
+/// # fn example() -> Result<(), Box<dyn Error>> {
+/// // Load CSV file
+/// let parser = CsvSliceParser::from_file("data.csv")?;
+///
+/// // Parse a specific column slice
+/// let slice_0: Vec<Entry> = parser.parse_slice(0)?;
+///
+/// // Parse all slices at once
+/// let all_slices: Vec<Vec<Entry>> = parser.parse_all_slices()?;
+///
+/// // Use iterator for memory-efficient processing
+/// for result in parser.parse_slice_iter::<Entry>(0)? {
+///     let entry = result?;
+///     println!("{:?}", entry);
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub struct CsvSliceParser {
+    headers: StringRecord,
+    records: Vec<StringRecord>,
+    config: ParseConfig,
 }
 
-#[cfg(test)]
-mod tests {
-//! # CSV Partitioner
-//!
-//! This library provides utilities for partitioning CSV files into logical groups based on column ranges.
-//! It is particularly useful for cases where a CSV file contains multiple topics or categories, each spanning a fixed number of columns.
-//!
-//! ## Features
-//! - Partition CSV columns into named groups (topics).
-//! - Iterate over rows and process each group as a logical unit.
-//! - Easily map CSV data into custom Rust structs.
-//!
-//! ## Example
-//!
-//! Suppose you have a CSV file (`vocab.csv`) containing Japanese vocabulary, where each topic (e.g., verbs, adjectives) occupies a fixed set of columns:
-//!
-//! ```csv
-//! verbs    ,                ,     , adjectives,                     ,         
-//! おどろく , to be surprised, 驚く , はやい   , fast/quick            ,  早い
-//! しぬ     , to die         , 死ぬ , むずかしい, difficult/troublesome, 難しい
-//! ```
-//!
-//! You can define partitions for each topic and process the CSV as follows:
-//!
-//! ```rust
-//! let partitions = vec![
-//!     Partition { name: "verbs".into(), range: 0..3 },
-//!     Partition { name: "adjectives".into(), range: 3..6 },
-//! ];
-//!
-//! let mut csvp = CsvPartitioner::new(rdr, partitions);
-//! csvp.for_each_row(|row, partitions| {
-//!     let groups = row_to_groups(row, partitions);
-//!     // process each group...
-//! });
-//! ```
-//!
-//! ## Structs
-//! - `Partition`: Defines a named range of columns for a topic.
-//! - `CsvPartitioner`: Handles reading and partitioning the CSV file.
-//!
-//! ## Usage
-//! 1. Define your partitions as a vector of `Partition`.
-//! 2. Create a `CsvPartitioner` with a CSV reader and the partitions.
-//! 3. Use `for_each_row` to process each row, mapping column groups to your own structs.
-//!
-//! ## Testing
-//! The library includes tests demonstrating how to partition a CSV file and map its contents to custom structs for further processing.
-//!
-    use super::*;
-
-    // using for examples,
-    #[derive(Debug, PartialEq)]
-    struct Topic {
-        name: String,
-        words: Vec<Word>
+impl CsvSliceParser {
+    /// Loads a CSV file with a default configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the CSV file
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(CsvSliceParser)` - Successfully loaded parser
+    /// * `Err(Box<dyn Error>)` - I/O or parsing error
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use csv_slice_parser::CsvSliceParser;
+    /// # use std::error::Error;
+    /// # fn example() -> Result<(), Box<dyn Error>> {
+    /// let parser = CsvSliceParser::from_file("vocabulary.csv")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn Error>> {
+        Self::from_file_with_config(path, ParseConfig::default())
     }
 
-    #[derive(Debug, PartialEq)]
-    struct Word {
-        japanese: String,
-        translation: String,
-        kanji: String,
+    /// Load a CSV file with custom configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the CSV file
+    /// * `config` - Custom parsing configuration
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use csv_slice_parser::{CsvSliceParser, ParseConfig};
+    /// # use std::error::Error;
+    /// # fn example() -> Result<(), Box<dyn Error>> {
+    /// let config = ParseConfig {
+    ///     skip_empty_rows: false,  // Keep all rows
+    ///     reserve_capacity: true,
+    ///     trim_fields: false,      // Keep whitespace
+    /// };
+    /// let parser = CsvSliceParser::from_file_with_config("data.csv", config)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn from_file_with_config<P: AsRef<Path>>(
+        path: P,
+        config: ParseConfig
+    ) -> Result<Self, Box<dyn Error>> {
+        let file = File::open(path)?;
+        let mut reader = ReaderBuilder::new()
+            .has_headers(true)
+            .trim(csv::Trim::All)
+            .from_reader(file);
+
+        let headers = reader.headers()?.clone();
+
+        let mut records: Vec<StringRecord> = if config.reserve_capacity {
+            Vec::with_capacity(headers.len())
+        } else {
+            Vec::new()
+        };
+
+        for result in reader.records() {
+            records.push(result?);
+        }
+
+        if config.reserve_capacity {
+            records.shrink_to_fit();
+        }
+
+        Ok(CsvSliceParser { headers, records, config })
     }
 
-    #[test]
-    fn test1() -> Result<(), Box<dyn Error>> {
-        let file_path = "vocab.csv";
-        let rdr = csv::Reader::from_path(file_path)?;
 
-        // define partitions: verbs = columns 0..3, adjectives 3..6
-        let partitions = vec![
-            Partition { name: "verbs".into(), range: 0..3 },
-            Partition { name: "adjectives".into(), range: 3..6 },
-        ];
-
-        // initiate topics collection with empty word vectors
-        let mut topics: Vec<Topic> = partitions
-            .iter()
-            .map(|partition| Topic { name: partition.name.clone(), words: Vec::new() })
-            .collect();
-
-        let mut csvp = CsvPartitioner::new(rdr, partitions);
-
-        // single pass iteration using closure
-        csvp.for_each_row(|row, partitions| {
-            let groups = row_to_groups(row, partitions);
-
-            for (i, group) in groups.into_iter().enumerate() {
-                let word = Word {
-                    japanese: group.get(0).unwrap_or("").to_string(),
-                    translation: group.get(1).unwrap_or("").to_string(),
-                    kanji: group.get(2).unwrap_or("").to_string(),
-                };
-
-                topics[i].words.push(word);
-            }
-        })?;
-
-
-        assert_eq!(
-            topics[0], 
-            Topic {
-                name: "verbs".to_string(),
-                words: vec![
-                    Word { japanese: "おどろく".to_string(), translation: "to be surprised".to_string(), kanji: "驚く".to_string() },
-                    Word { japanese: "しぬ".to_string(), translation: "to die".to_string(), kanji: "死ぬ".to_string() },
-                ]
-            }
-        );
-
-        assert_eq!(
-            topics[1], 
-            Topic {
-                name: "adjectives".to_string(),
-                words: vec![
-                    Word { japanese: "はやい".to_string(), translation: "fast/quick".to_string(), kanji: "早い".to_string() },
-                    Word { japanese: "むずかしい".to_string(), translation: "difficult/troublesome".to_string(), kanji: "難しい".to_string() },
-                ]
-            }
-        );
-
-        Ok(())
+    /// Create a parser from in-memory `StringRecord` data.
+    ///
+    /// Useful for testing or when you've already parsed CSV data.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use csv_slice_parser::{CsvSliceParser, ParseConfig};
+    /// # use csv::StringRecord;
+    /// let mut headers = StringRecord::new();
+    /// headers.push_field("A");
+    /// headers.push_field("B");
+    /// headers.push_field("C");
+    ///
+    /// let mut record = StringRecord::new();
+    /// record.push_field("1");
+    /// record.push_field("2");
+    /// record.push_field("3");
+    ///
+    /// let parser = CsvSliceParser::from_records(
+    ///     headers,
+    ///     vec![record],
+    ///     ParseConfig::default()
+    /// );
+    /// ```
+    pub fn from_records(
+        headers: StringRecord,
+        records: Vec<StringRecord>,
+        config: ParseConfig,
+    ) -> Self {
+        CsvSliceParser { headers, records, config }
     }
 
-    #[test]
-    fn test2() -> Result<(), Box<dyn Error>> {
-        // using same vocab.csv from previous example
-        let rdr = csv::Reader::from_path("vocab.csv")?;
-        let mut csvp = CsvPartitioner::new_from_header(rdr)?;
+    /// Get the number of column slices available for a given type.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use csv_slice_parser::{CsvSliceParser, FromColumnSlice};
+    /// # use csv::StringRecord;
+    /// # use std::error::Error;
+    /// # struct MyType;
+    /// # impl FromColumnSlice for MyType {
+    /// #     const COLUMN_COUNT: usize = 3;
+    /// #     fn from_record(_: &StringRecord, _: usize) -> Result<Self, Box<dyn Error>> { Ok(MyType) }
+    /// # }
+    /// # fn example() -> Result<(), Box<dyn Error>> {
+    /// # let parser = CsvSliceParser::from_file("data.csv")?;
+    /// let count = parser.slice_count::<MyType>();
+    /// println!("Found {} slices of {} columns each", count, MyType::COLUMN_COUNT);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn slice_count<T: FromColumnSlice>(&self) -> usize {
+        self.headers.len() / T::COLUMN_COUNT
+    }
 
-        // initialise empty topics
-        let mut topics: Vec<Topic> = csvp.partitions
-            .iter()
-            .map(|p| Topic { name: p.name.clone(), words: Vec::new() })
-            .collect();
+    /// Get the total number of records (rows) in the CSV.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use csv_slice_parser::CsvSliceParser;
+    /// # use std::error::Error;
+    /// # fn example() -> Result<(), Box<dyn Error>> {
+    /// # let parser = CsvSliceParser::from_file("data.csv")?;
+    /// println!("CSV has {} rows", parser.record_count());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn record_count(&self) -> usize {
+        self.records.len()
+    }
 
-        // do the thing
-        csvp.for_each_row(|row, partitions| {
-            let groups = row_to_groups(row, partitions);
+    fn validate_slice_index<T: FromColumnSlice>(&self, slice_index: usize) -> Result<(usize, usize), Box<dyn Error>>{
+        let start_col = slice_index * T::COLUMN_COUNT;
+        let end_col = start_col + T::COLUMN_COUNT;
 
-            for (i, group) in groups.into_iter().enumerate() {
-                let word = Word {
-                    japanese: group.get(0).unwrap_or("").to_string(),
-                    translation: group.get(1).unwrap_or("").to_string(),
-                    kanji: group.get(2).unwrap_or("").to_string(),
-                };
-                topics[i].words.push(word);
+        if end_col > self.headers.len() {
+            return Err(format!(
+                "Slice {} out of bounds (columns {}-{} requested, but only {} columns available)",
+                slice_index, start_col, end_col, self.headers.len()
+            ).into());
+        }
+
+        Ok((start_col, end_col))
+    }
+
+    fn has_empty_fields(&self, start_col: usize, end_col: usize, record: &StringRecord) -> bool {
+        (start_col..end_col)
+            .all(|i| record.get(i).map_or(true, |s| s.trim().is_empty()))
+    }
+
+    /// Parse a specific column slice into a vector of structs.
+    ///
+    /// This is the main parsing method. It deserializes all rows for a given
+    /// column slice into your custom struct type.
+    ///
+    /// # Arguments
+    ///
+    /// * `slice_index` - Zero-based index of the slice to parse
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Vec<T>)` - Successfully parsed entries
+    /// * `Err(Box<dyn Error>)` - Slice out of bounds or parsing error
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use csv_slice_parser::{CsvSliceParser, FromColumnSlice};
+    /// # use csv::StringRecord;
+    /// # use std::error::Error;
+    /// # #[derive(Debug)]
+    /// # struct VocabEntry { word: String, translation: String, example: String }
+    /// # impl FromColumnSlice for VocabEntry {
+    /// #     const COLUMN_COUNT: usize = 3;
+    /// #     fn from_record(record: &StringRecord, start_col: usize) -> Result<Self, Box<dyn Error>> {
+    /// #         Ok(VocabEntry {
+    /// #             word: record.get(start_col).unwrap_or("").to_string(),
+    /// #             translation: record.get(start_col + 1).unwrap_or("").to_string(),
+    /// #             example: record.get(start_col + 2).unwrap_or("").to_string(),
+    /// #         })
+    /// #     }
+    /// # }
+    /// # fn example() -> Result<(), Box<dyn Error>> {
+    /// # let parser = CsvSliceParser::from_file("vocab.csv")?;
+    /// // Parse columns 0-2 (first slice)
+    /// let first_language: Vec<VocabEntry> = parser.parse_slice(0)?;
+    ///
+    /// // Parse columns 3-5 (second slice)
+    /// let second_language: Vec<VocabEntry> = parser.parse_slice(1)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn parse_slice<T: FromColumnSlice>(&self, slice_index: usize) -> Result<Vec<T>, Box<dyn Error>> {
+        let (start_col, end_col) = self.validate_slice_index::<T>(slice_index)?;
+
+        let mut results = if self.config.reserve_capacity {
+            Vec::with_capacity(self.records.len())
+        } else {
+            Vec::new()
+        };
+
+        for record in &self.records {
+            if self.config.skip_empty_rows {
+                if self.has_empty_fields(start_col, end_col, record) {
+                    continue
+                }
             }
-        })?;
+            results.push(T::from_record(record, start_col)?);
+        }
 
-        assert_eq!(
-            topics[0], 
-            Topic {
-                name: "verbs".to_string(),
-                words: vec![
-                    Word { japanese: "おどろく".to_string(), translation: "to be surprised".to_string(), kanji: "驚く".to_string() },
-                    Word { japanese: "しぬ".to_string(), translation: "to die".to_string(), kanji: "死ぬ".to_string() },
-                ]
+        results.shrink_to_fit();
+
+        Ok(results)
+    }
+
+    /// Parse a slice lazily with an iterator.
+    ///
+    /// This provides memory-efficient processing by parsing records on-demand
+    /// instead of allocating all results upfront.
+    ///
+    /// # Arguments
+    ///
+    /// * `slice_index` - Zero-based index of the slice to parse
+    ///
+    /// # Returns
+    ///
+    /// An iterator that yields `Result<T, Box<dyn Error>>` for each row.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use csv_slice_parser::{CsvSliceParser, FromColumnSlice};
+    /// # use csv::StringRecord;
+    /// # use std::error::Error;
+    /// # #[derive(Debug)]
+    /// # struct Entry { field: String }
+    /// # impl FromColumnSlice for Entry {
+    /// #     const COLUMN_COUNT: usize = 1;
+    /// #     fn from_record(record: &StringRecord, start_col: usize) -> Result<Self, Box<dyn Error>> {
+    /// #         Ok(Entry { field: record.get(start_col).unwrap_or("").to_string() })
+    /// #     }
+    /// # }
+    /// # fn example() -> Result<(), Box<dyn Error>> {
+    /// # let parser = CsvSliceParser::from_file("data.csv")?;
+    /// // Process only the first 100 entries
+    /// for result in parser.parse_slice_iter::<Entry>(0)?.take(100) {
+    ///     let entry = result?;
+    ///     println!("{:?}", entry);
+    /// }
+    ///
+    /// // Filter while parsing
+    /// let filtered: Vec<Entry> = parser.parse_slice_iter::<Entry>(0)?
+    ///     .filter_map(Result::ok)
+    ///     .filter(|e| e.field.len() > 5)
+    ///     .collect();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn parse_slice_iter<'a, T: FromColumnSlice + 'a>(
+        &'a self,
+        slice_index: usize
+    ) -> Result<impl Iterator<Item = Result<T, Box<dyn Error>>> + 'a, Box<dyn Error>> {
+        let (start_col, end_col) = self.validate_slice_index::<T>(slice_index)?;
+
+        Ok(self.records.iter().filter_map(move |record| {
+            if self.config.skip_empty_rows {
+                if self.has_empty_fields(start_col, end_col, record) {
+                    return None;
+                }
             }
-        );
+            Some(T::from_record(record, start_col))
+        }))
+    }
 
-        assert_eq!(
-            topics[1], 
-            Topic {
-                name: "adjectives".to_string(),
-                words: vec![
-                    Word { japanese: "はやい".to_string(), translation: "fast/quick".to_string(), kanji: "早い".to_string() },
-                    Word { japanese: "むずかしい".to_string(), translation: "difficult/troublesome".to_string(), kanji: "難しい".to_string() },
-                ]
-            }
-        );
+    /// Parse all slices into separate vectors.
+    ///
+    /// Convenience method to parse every available slice in one call.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use csv_slice_parser::{CsvSliceParser, FromColumnSlice};
+    /// # use csv::StringRecord;
+    /// # use std::error::Error;
+    /// # #[derive(Debug)]
+    /// # struct Entry { field: String }
+    /// # impl FromColumnSlice for Entry {
+    /// #     const COLUMN_COUNT: usize = 3;
+    /// #     fn from_record(record: &StringRecord, start_col: usize) -> Result<Self, Box<dyn Error>> {
+    /// #         Ok(Entry { field: "".into() })
+    /// #     }
+    /// # }
+    /// # fn example() -> Result<(), Box<dyn Error>> {
+    /// # let parser = CsvSliceParser::from_file("data.csv")?;
+    /// let all_slices: Vec<Vec<Entry>> = parser.parse_all_slices()?;
+    ///
+    /// for (i, slice) in all_slices.iter().enumerate() {
+    ///     println!("Slice {} has {} entries", i, slice.len());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn parse_all_slices<T: FromColumnSlice>(&self) -> Result<Vec<Vec<T>>, Box<dyn Error>> {
+        let slice_count = self.slice_count::<T>();
+        let mut all_slices: Vec<Vec<T>> = Vec::with_capacity(slice_count);
 
-        Ok(())
+        for i in 0..slice_count {
+            all_slices.push(self.parse_slice(i)?)
+        }
+
+        Ok(all_slices)
+    }
+
+    /// Get the column headers for a specific slice.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use csv_slice_parser::{CsvSliceParser, FromColumnSlice};
+    /// # use csv::StringRecord;
+    /// # use std::error::Error;
+    /// # struct Entry;
+    /// # impl FromColumnSlice for Entry {
+    /// #     const COLUMN_COUNT: usize = 3;
+    /// #     fn from_record(_: &StringRecord, _: usize) -> Result<Self, Box<dyn Error>> { Ok(Entry) }
+    /// # }
+    /// # fn example() -> Result<(), Box<dyn Error>> {
+    /// # let parser = CsvSliceParser::from_file("data.csv")?;
+    /// if let Some(headers) = parser.slice_headers::<Entry>(0) {
+    ///     println!("Slice 0 headers: {:?}", headers);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn slice_headers<T: FromColumnSlice>(&self, slice_index: usize) -> Option<Vec<&str>> {
+        let start_col = slice_index * T::COLUMN_COUNT;
+        let end_col = slice_index + T::COLUMN_COUNT;
+
+        if end_col > self.headers.len() {
+            None
+        } else {
+            Some((start_col..end_col)
+                .filter_map(|i| self.headers.get(i))
+                .collect())
+        }
+    }
+
+    /// Access the underlying CSV records for custom processing.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use csv_slice_parser::CsvSliceParser;
+    /// # use std::error::Error;
+    /// # fn example() -> Result<(), Box<dyn Error>> {
+    /// # let parser = CsvSliceParser::from_file("data.csv")?;
+    /// for record in parser.records() {
+    ///     // Custom processing logic
+    ///     println!("Record has {} fields", record.len());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn records(&self) -> &[StringRecord] {
+        &self.records
+    }
+
+    /// Access the CSV headers.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use csv_slice_parser::CsvSliceParser;
+    /// # use std::error::Error;
+    /// # fn example() -> Result<(), Box<dyn Error>> {
+    /// # let parser = CsvSliceParser::from_file("data.csv")?;
+    /// let headers = parser.headers();
+    /// println!("CSV has {} columns", headers.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn headers(&self) -> &StringRecord {
+        &self.headers
     }
 }
